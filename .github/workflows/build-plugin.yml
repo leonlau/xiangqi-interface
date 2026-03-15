@@ -1,0 +1,125 @@
+name: Build Plugin
+
+on:
+  push:
+    branches: [master, main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.target.goos }}-${{ matrix.target.goarch }} / Go ${{ matrix.go }}
+    strategy:
+      fail-fast: false
+      matrix:
+        go:
+          - "1.27.0"
+          - "1.26.7"
+        target:
+          - { os: ubuntu-latest,    goos: linux,  goarch: amd64 }
+          - { os: ubuntu-24.04-arm, goos: linux,  goarch: arm64 }
+          - { os: macos-latest,     goos: darwin, goarch: arm64 }
+    runs-on: ${{ matrix.target.os }}
+    environment: ci
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache-dependency-path: |
+            plugin/go.sum
+            sdk/go.sum
+            go.sum
+
+      - name: Print Go version
+        run: go version
+
+      - name: Fetch engine source
+        env:
+          ENGINE_REPO_URL: ${{ vars.ENGINE_REPO_URL }}
+          ENGINE_REPO_TOKEN: ${{ secrets.ENGINE_REPO_TOKEN }}
+        run: |
+          if [ -z "$ENGINE_REPO_URL" ] || [ -z "$ENGINE_REPO_TOKEN" ]; then
+            echo "::error::Required repo configuration missing"
+            exit 1
+          fi
+          # 去掉可能的 https:// 前缀(避免双 scheme)
+          url="${ENGINE_REPO_URL#https://}"
+          url="${url#http://}"
+          mkdir -p vendor
+          git clone --depth 1 "https://x-access-token:${ENGINE_REPO_TOKEN}@${url}" vendor/engine
+
+      - name: Unit tests
+        run: make test
+
+      - name: Build plugin
+        env:
+          GOOS: ${{ matrix.target.goos }}
+          GOARCH: ${{ matrix.target.goarch }}
+          CGO_ENABLED: "1"
+        run: |
+          mkdir -p dist
+          cd plugin
+          go build -buildmode=plugin -o "../dist/libengine-${GOOS}-${GOARCH}.so" .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libengine-${{ matrix.target.goos }}-${{ matrix.target.goarch }}-go${{ matrix.go }}
+          path: dist/*.so
+
+  smoke-test:
+    name: smoke linux-amd64
+    needs: build
+    runs-on: ubuntu-latest
+    environment: ci
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.0"
+          cache-dependency-path: |
+            plugin/go.sum
+            sdk/go.sum
+            go.sum
+
+      - name: Download linux-amd64 .so
+        uses: actions/download-artifact@v4
+        with:
+          name: libengine-linux-amd64-go1.27.0
+          path: dist
+
+      - name: Smoke test built .so
+        working-directory: cmd/example
+        env:
+          ENGINE_PLUGIN: ${{ github.workspace }}/dist/libengine-linux-amd64.so
+        run: CGO_ENABLED=1 go run .
+
+  release:
+    needs: [build, smoke-test]
+    runs-on: ubuntu-latest
+    environment: ci
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/libengine-*.so
